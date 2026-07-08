@@ -1,0 +1,987 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Interactive walkthrough of a zero-copy, length-prefixed framing codec over Tokio — drive the bytes and watch the decoder handle partial frames and zero-copy handoff.">
+<title>Anatomy of a Framing Codec</title>
+<style>
+  :root {
+    --ink: #0e141f;
+    --panel: #151d2b;
+    --panel-2: #1c2637;
+    --raise: #223046;
+    --line: #2b384c;
+    --line-soft: #223044;
+    --text: #ced7e6;
+    --muted: #808da5;
+    --faint: #56637b;
+    --amber: #f2b134;
+    --amber-soft: rgba(242, 177, 52, 0.14);
+    --cyan: #46c8d4;
+    --cyan-soft: rgba(70, 200, 212, 0.14);
+    --green: #5cd6a0;
+    --green-soft: rgba(92, 214, 160, 0.14);
+    --red: #ff6f6f;
+    --red-soft: rgba(255, 111, 111, 0.14);
+    --mono: ui-monospace, "JetBrains Mono", "SF Mono", "Menlo", "Consolas", monospace;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --maxw: 940px;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1200px 620px at 78% -8%, rgba(242, 177, 52, 0.07), transparent 60%),
+      radial-gradient(1000px 560px at 8% 4%, rgba(70, 200, 212, 0.06), transparent 55%),
+      var(--ink);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 24px; }
+
+  /* ---------- typographic system ---------- */
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.26em;
+    text-transform: uppercase;
+    color: var(--amber);
+    margin: 0 0 14px;
+  }
+  h1 {
+    font-family: var(--mono);
+    font-weight: 600;
+    font-size: clamp(30px, 6vw, 52px);
+    line-height: 1.04;
+    letter-spacing: -0.01em;
+    margin: 0 0 20px;
+    text-wrap: balance;
+    color: #f4f7fc;
+  }
+  h2 {
+    font-family: var(--mono);
+    font-weight: 600;
+    font-size: clamp(21px, 3.4vw, 27px);
+    letter-spacing: -0.005em;
+    margin: 0 0 6px;
+    color: #eef2f8;
+    text-wrap: balance;
+  }
+  h3 {
+    font-family: var(--sans);
+    font-weight: 650;
+    font-size: 17px;
+    letter-spacing: 0.01em;
+    margin: 0 0 8px;
+    color: #e7edf6;
+  }
+  p { margin: 0 0 16px; max-width: 68ch; }
+  .lede { font-size: 20px; color: #cbd4e4; max-width: 64ch; }
+  strong { color: #f1f5fb; font-weight: 650; }
+  code {
+    font-family: var(--mono);
+    font-size: 0.9em;
+    background: var(--panel-2);
+    border: 1px solid var(--line-soft);
+    border-radius: 5px;
+    padding: 0.08em 0.4em;
+    color: #dfe7f2;
+  }
+  a { color: var(--amber); }
+
+  .kicker {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--faint);
+  }
+
+  /* ---------- section rhythm ---------- */
+  header.hero { padding: 84px 0 34px; }
+  section { padding: 40px 0; border-top: 1px solid var(--line-soft); }
+  .sec-head { display: flex; gap: 16px; align-items: baseline; margin-bottom: 22px; }
+  .sec-num {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--amber);
+    letter-spacing: 0.12em;
+    padding-top: 4px;
+    min-width: 34px;
+  }
+
+  /* ---------- panels ---------- */
+  .panel {
+    background: linear-gradient(180deg, var(--panel), var(--panel-2));
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 22px;
+  }
+  .panel-tight { padding: 16px; }
+
+  /* ---------- wire-format hero strip ---------- */
+  .wire {
+    display: flex;
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    font-family: var(--mono);
+    margin: 4px 0 8px;
+  }
+  .wire > div { padding: 18px 20px; }
+  .wire .w-len {
+    background: var(--cyan-soft);
+    border-right: 2px dashed var(--cyan);
+    color: var(--cyan);
+    flex: 0 0 auto;
+  }
+  .wire .w-pay { background: var(--amber-soft); color: var(--amber); flex: 1; }
+  .wire .w-cap { font-size: 12px; letter-spacing: 0.08em; opacity: 0.85; display: block; margin-top: 4px; }
+  .wire .w-big { font-size: 15px; font-weight: 600; letter-spacing: 0.02em; }
+
+  /* ---------- tcp boundary diagram ---------- */
+  .tcp {
+    display: grid;
+    gap: 10px;
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+  .tcp-row { display: flex; gap: 4px; }
+  .tcp-label { color: var(--muted); font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; margin-bottom: 6px; }
+  .seg {
+    padding: 12px 6px;
+    text-align: center;
+    border-radius: 7px;
+    font-weight: 600;
+    color: #0e141f;
+    white-space: nowrap;
+  }
+  .seg.a { background: #6fce9f; }
+  .seg.b { background: var(--amber); }
+  .seg.c { background: var(--cyan); }
+  .pipe {
+    position: relative;
+    height: 34px;
+    border-radius: 7px;
+    background: repeating-linear-gradient(90deg, var(--panel-2) 0 14px, transparent 14px 28px);
+    border: 1px solid var(--line);
+    overflow: hidden;
+  }
+  .pipe::after {
+    content: "";
+    position: absolute; inset: 0;
+    background: linear-gradient(90deg, transparent, rgba(242, 177, 52, 0.5), transparent);
+    width: 40%;
+    animation: flow 2.6s linear infinite;
+  }
+  @keyframes flow { from { transform: translateX(-120%); } to { transform: translateX(320%); } }
+  .read-cut { border-left: 2px dashed var(--red); }
+
+  /* ---------- simulator ---------- */
+  .sim { display: grid; gap: 18px; }
+  .sim-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  .scenario-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 4px; }
+  button {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--text);
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 9px 14px;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s, color 0.15s, transform 0.05s;
+    letter-spacing: 0.01em;
+  }
+  button:hover:not(:disabled) { border-color: var(--amber); color: #fff; }
+  button:active:not(:disabled) { transform: translateY(1px); }
+  button:disabled { opacity: 0.36; cursor: not-allowed; }
+  button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+  button.primary { background: var(--amber); color: #17130a; border-color: var(--amber); font-weight: 600; }
+  button.primary:hover:not(:disabled) { background: #ffc65a; color: #17130a; }
+  button.tab { background: transparent; }
+  button.tab[aria-pressed="true"] { background: var(--amber-soft); border-color: var(--amber); color: var(--amber); }
+
+  .sim-readout {
+    display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: center;
+    font-family: var(--mono); font-size: 13px;
+    padding: 12px 14px;
+    background: var(--ink);
+    border: 1px solid var(--line-soft);
+    border-radius: 10px;
+  }
+  .ro-item { display: flex; gap: 8px; align-items: baseline; }
+  .ro-k { color: var(--faint); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; }
+  .ro-v { color: var(--text); font-variant-numeric: tabular-nums; }
+
+  .stage-label { font-family: var(--mono); font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--muted); margin-bottom: 10px; display: flex; align-items: center; gap: 10px; }
+
+  /* incoming stream */
+  .stream-track {
+    display: flex; gap: 4px; flex-wrap: wrap; min-height: 26px;
+  }
+  .sbyte {
+    width: 22px; height: 22px; border-radius: 4px;
+    background: var(--panel-2); border: 1px solid var(--line-soft);
+    display: grid; place-items: center;
+    font-family: var(--mono); font-size: 9px; color: var(--faint);
+  }
+  .sbyte.next { border-color: var(--amber); color: var(--amber); box-shadow: 0 0 0 1px var(--amber-soft); }
+  .sbyte.gone { opacity: 0.16; }
+
+  /* buffer cells */
+  .buffer-scroll { overflow-x: auto; padding-bottom: 6px; }
+  .buffer-track { display: flex; gap: 6px; min-height: 66px; align-items: flex-end; }
+  .cell {
+    position: relative;
+    width: 42px; flex: 0 0 42px;
+    border-radius: 7px;
+    border: 1px solid var(--line);
+    background: var(--panel-2);
+    padding: 7px 0 6px;
+    text-align: center;
+    font-family: var(--mono);
+    transition: transform 0.25s, opacity 0.25s, background 0.2s, border-color 0.2s;
+  }
+  .cell .hex { font-size: 14px; font-weight: 600; color: var(--text); letter-spacing: 0.02em; }
+  .cell .asc { font-size: 10px; color: var(--muted); margin-top: 2px; height: 12px; }
+  .cell .idx { position: absolute; top: -18px; left: 0; right: 0; font-size: 9px; color: var(--faint); }
+  .cell.prefix { background: var(--cyan-soft); border-color: var(--cyan); }
+  .cell.prefix .hex { color: var(--cyan); }
+  .cell.payload { background: var(--amber-soft); border-color: var(--amber); }
+  .cell.payload .hex { color: var(--amber); }
+  .cell.emit { animation: emit 0.45s ease; }
+  @keyframes emit { 0% { transform: translateY(0); } 45% { transform: translateY(-10px); background: var(--green-soft); border-color: var(--green); } 100% { transform: translateY(0); } }
+  .cell.ghost {
+    border-style: dashed; border-color: var(--faint);
+    background: repeating-linear-gradient(135deg, transparent 0 5px, rgba(255,255,255,0.02) 5px 10px);
+  }
+  .cell.ghost .hex { color: var(--faint); }
+  .buffer-empty { color: var(--faint); font-family: var(--mono); font-size: 13px; padding: 20px 4px; }
+
+  .reserve-note { font-family: var(--mono); font-size: 12px; color: var(--cyan); margin-top: 10px; min-height: 18px; }
+  .reserve-note.pay { color: var(--amber); }
+
+  /* decoder verdict */
+  .verdict {
+    font-family: var(--mono); font-size: 14px;
+    padding: 13px 16px; border-radius: 10px;
+    border: 1px solid var(--line);
+    background: var(--ink);
+    display: flex; gap: 12px; align-items: center;
+    min-height: 50px;
+  }
+  .verdict .tag { font-weight: 700; padding: 2px 9px; border-radius: 6px; font-size: 12px; letter-spacing: 0.04em; white-space: nowrap; }
+  .tag.none { background: rgba(128,141,165,0.16); color: var(--muted); }
+  .tag.some { background: var(--green-soft); color: var(--green); }
+  .tag.err { background: var(--red-soft); color: var(--red); }
+  .tag.idle { background: var(--panel-2); color: var(--faint); }
+  .verdict .vtext { color: var(--text); }
+
+  /* trace log */
+  .trace {
+    font-family: var(--mono); font-size: 12.5px;
+    background: var(--ink); border: 1px solid var(--line-soft); border-radius: 10px;
+    padding: 6px 0; max-height: 210px; overflow-y: auto;
+  }
+  .trace .line { padding: 4px 15px; display: flex; gap: 10px; border-left: 2px solid transparent; }
+  .trace .line .num { color: var(--faint); min-width: 20px; text-align: right; }
+  .trace .line .msg { color: var(--muted); }
+  .trace .line.some { border-left-color: var(--green); }
+  .trace .line.some .msg { color: var(--green); }
+  .trace .line.err { border-left-color: var(--red); }
+  .trace .line.err .msg { color: var(--red); }
+  .trace .line.recv { border-left-color: var(--amber); }
+  .trace .line.recv .msg { color: var(--amber); }
+  .trace-empty { color: var(--faint); padding: 12px 15px; }
+
+  /* emitted frames */
+  .emitted { display: flex; gap: 10px; flex-wrap: wrap; min-height: 30px; }
+  .frame-chip {
+    display: inline-flex; flex-direction: column; gap: 2px;
+    border: 1px solid var(--green); background: var(--green-soft);
+    border-radius: 9px; padding: 8px 12px;
+    font-family: var(--mono); animation: pop 0.35s ease;
+  }
+  @keyframes pop { from { opacity: 0; transform: scale(0.85); } to { opacity: 1; transform: scale(1); } }
+  .frame-chip .fc-pay { color: var(--green); font-size: 13px; font-weight: 600; }
+  .frame-chip .fc-meta { color: var(--muted); font-size: 10px; letter-spacing: 0.05em; }
+  .emitted-empty { color: var(--faint); font-family: var(--mono); font-size: 13px; padding: 4px 0; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 14px 20px; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .swatch { width: 12px; height: 12px; border-radius: 3px; border: 1px solid; }
+  .sw-cyan { background: var(--cyan-soft); border-color: var(--cyan); }
+  .sw-amber { background: var(--amber-soft); border-color: var(--amber); }
+  .sw-green { background: var(--green-soft); border-color: var(--green); }
+  .sw-red { background: var(--red-soft); border-color: var(--red); }
+  .sw-ghost { background: transparent; border-color: var(--faint); border-style: dashed; }
+
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 720px) { .grid-2 { grid-template-columns: 1fr; } }
+
+  /* zero-copy diagram */
+  .zc-toggle { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; margin-bottom: 18px; }
+  .zc-toggle button { border: none; border-radius: 0; }
+  .zc-toggle button[aria-pressed="true"] { background: var(--amber-soft); color: var(--amber); }
+  .alloc {
+    font-family: var(--mono);
+    border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-bottom: 12px;
+    background: var(--ink);
+  }
+  .alloc-title { font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); margin-bottom: 10px; display: flex; justify-content: space-between; }
+  .alloc-bar { display: flex; gap: 3px; }
+  .alloc-bar .b { height: 30px; flex: 1; border-radius: 3px; background: var(--panel-2); border: 1px solid var(--line-soft); }
+  .alloc-bar .b.pay { background: var(--amber-soft); border-color: var(--amber); }
+  .refbadge { color: var(--green); }
+  .view-bracket { position: relative; height: 24px; }
+  .arrow-copy { color: var(--red); font-size: 13px; }
+  .arrow-view { color: var(--green); font-size: 13px; }
+
+  /* annotated code */
+  pre {
+    font-family: var(--mono); font-size: 13.5px; line-height: 1.72;
+    background: var(--ink); border: 1px solid var(--line); border-radius: 12px;
+    padding: 20px 22px; overflow-x: auto; margin: 0 0 12px;
+  }
+  pre .c { color: var(--faint); font-style: italic; }
+  pre .kw { color: #7fb0ff; }
+  pre .fn { color: var(--amber); }
+  pre .ty { color: var(--cyan); }
+  pre .lit { color: var(--green); }
+  pre .hl-cyan { background: var(--cyan-soft); border-radius: 3px; padding: 0 2px; }
+  pre .hl-amber { background: var(--amber-soft); border-radius: 3px; padding: 0 2px; }
+  pre .hl-red { background: var(--red-soft); border-radius: 3px; padding: 0 2px; }
+  pre .hl-green { background: var(--green-soft); border-radius: 3px; padding: 0 2px; }
+
+  ul.clean { list-style: none; padding: 0; margin: 0 0 16px; display: grid; gap: 12px; }
+  ul.clean li { display: flex; gap: 12px; }
+  ul.clean li .mk { color: var(--amber); font-family: var(--mono); flex: 0 0 auto; }
+
+  .mental { display: grid; gap: 12px; }
+  .mental .card { border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; background: var(--panel); }
+  .mental .card .q { font-family: var(--mono); font-size: 12px; color: var(--cyan); letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 6px; }
+
+  footer { padding: 44px 0 70px; color: var(--muted); font-size: 14px; }
+  .hairline { height: 1px; background: var(--line-soft); margin: 0; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+    .pipe::after { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+
+  <header class="hero">
+    <p class="eyebrow">Interactive walkthrough · framed-echo</p>
+    <h1>Anatomy of a<br>framing codec</h1>
+    <p class="lede">TCP hands you a formless stream of bytes. To get discrete messages back out, you frame them: a length, then a payload. This page lets you <strong>drive the bytes yourself</strong> and watch the decoder make every decision — the two hard parts, partial reads and zero-copy, made visible.</p>
+
+    <div class="wire" aria-hidden="true" style="margin-top:26px">
+      <div class="w-len">
+        <span class="w-big">length : u32</span>
+        <span class="w-cap">4 bytes · big-endian</span>
+      </div>
+      <div class="w-pay">
+        <span class="w-big">payload</span>
+        <span class="w-cap">exactly <em>length</em> bytes</span>
+      </div>
+    </div>
+    <p style="font-family:var(--mono);font-size:12.5px;color:var(--muted);max-width:68ch">Read four bytes to learn the size. Read that many more to get the message. That single idea — repeated correctly under messy network conditions — is the whole protocol.</p>
+  </header>
+
+  <!-- 1 · THE PROBLEM -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">01</div>
+      <div>
+        <h2>TCP has no message boundaries</h2>
+        <p class="kicker">why framing has to exist at all</p>
+      </div>
+    </div>
+    <p>TCP guarantees your bytes arrive <strong>in order</strong> and <strong>intact</strong>. It guarantees nothing about <em>grouping</em>. Three <code>write()</code> calls can land in the reader as one big chunk, or be sliced at arbitrary points. The boundaries you sent with are gone the moment the bytes hit the wire.</p>
+
+    <div class="panel" style="margin:8px 0 18px">
+      <div class="tcp">
+        <div>
+          <div class="tcp-label">what you write() — 3 distinct messages</div>
+          <div class="tcp-row">
+            <div class="seg a" style="flex:2">MESSAGE&nbsp;A</div>
+            <div class="seg b" style="flex:3">MESSAGE&nbsp;B</div>
+            <div class="seg c" style="flex:1.4">MSG&nbsp;C</div>
+          </div>
+        </div>
+        <div class="pipe" role="presentation"></div>
+        <div>
+          <div class="tcp-label">what read() hands you — same bytes, regrouped</div>
+          <div class="tcp-row">
+            <div class="seg a" style="flex:2">A</div>
+            <div class="seg b" style="flex:1.2">B&hellip;</div>
+            <div class="seg b read-cut" style="flex:1.8">&hellip;B</div>
+            <div class="seg c read-cut" style="flex:1.4">C</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <p style="color:var(--muted);font-size:15px">The dashed red edges are where a single <code>read()</code> happened to cut. Message B got split across two reads; C got glued onto the tail of B's. <strong>Order preserved, boundaries lost.</strong> A length prefix is how you put the boundaries back.</p>
+  </section>
+
+  <!-- 2 · THE SIMULATOR -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">02</div>
+      <div>
+        <h2>Drive the decoder</h2>
+        <p class="kicker">deliver bytes the way a real socket would — and watch each decode() call decide</p>
+      </div>
+    </div>
+
+    <p>Pick a scenario, then feed the receive buffer in chunks. Each time bytes arrive, the codec's <code>decode()</code> is called repeatedly until it can't make progress. Watch what it returns: <code>Ok(None)</code> means <em>"not enough yet, keep what you have and call me again"</em>; <code>Ok(Some(frame))</code> means a whole frame came out.</p>
+
+    <div class="panel sim">
+      <div>
+        <div class="scenario-tabs" id="tabs" role="group" aria-label="Scenario"></div>
+        <p id="scenario-desc" style="color:var(--muted);font-size:14px;margin:6px 0 0;max-width:70ch"></p>
+      </div>
+
+      <div class="sim-controls">
+        <button id="btn-read" class="primary">▸ Receive next read()</button>
+        <button id="btn-drip">Drip 1 byte</button>
+        <button id="btn-all">Receive all</button>
+        <button id="btn-reset">Reset</button>
+      </div>
+
+      <div class="sim-readout" aria-live="polite">
+        <div class="ro-item"><span class="ro-k">scenario</span><span class="ro-v" id="ro-name">—</span></div>
+        <div class="ro-item"><span class="ro-k">max_frame_len</span><span class="ro-v" id="ro-max">—</span></div>
+        <div class="ro-item"><span class="ro-k">in buffer</span><span class="ro-v" id="ro-buf">0 B</span></div>
+        <div class="ro-item"><span class="ro-k">frames out</span><span class="ro-v" id="ro-out">0</span></div>
+      </div>
+
+      <div>
+        <div class="stage-label">◇ Incoming — bytes still on the wire, not yet read()</div>
+        <div class="stream-track" id="stream"></div>
+      </div>
+
+      <div>
+        <div class="stage-label">▤ Receive buffer — <code style="font-size:11px">BytesMut</code> the decoder reads from</div>
+        <div class="buffer-scroll">
+          <div class="buffer-track" id="buffer"></div>
+        </div>
+        <div class="reserve-note" id="reserve"></div>
+      </div>
+
+      <div>
+        <div class="stage-label">→ Latest decode() verdict</div>
+        <div class="verdict" id="verdict" aria-live="polite">
+          <span class="tag idle">idle</span>
+          <span class="vtext">Receive some bytes to call the decoder.</span>
+        </div>
+      </div>
+
+      <div class="grid-2">
+        <div>
+          <div class="stage-label">≡ Decoder trace</div>
+          <div class="trace" id="trace"><div class="trace-empty">No calls yet.</div></div>
+        </div>
+        <div>
+          <div class="stage-label">✓ Emitted frames <span style="color:var(--faint)">— each a zero-copy Bytes view</span></div>
+          <div class="emitted" id="emitted"><div class="emitted-empty">None yet.</div></div>
+        </div>
+      </div>
+
+      <div class="legend" aria-hidden="true">
+        <span><i class="swatch sw-cyan"></i> length prefix (4 B)</span>
+        <span><i class="swatch sw-amber"></i> payload</span>
+        <span><i class="swatch sw-ghost"></i> reserved (hint for next read)</span>
+        <span><i class="swatch sw-green"></i> emitted frame</span>
+        <span><i class="swatch sw-red"></i> rejected</span>
+      </div>
+    </div>
+
+    <p style="margin-top:18px;color:var(--muted);font-size:15px">Notice the pattern: the decoder <strong>never destroys buffered bytes it can't yet use</strong>. A half-arrived frame just sits in the buffer, and the <span style="color:var(--cyan)">reserve hint</span> tells the transport roughly how many more bytes to go fetch. That's the entire trick to surviving arbitrary network fragmentation.</p>
+  </section>
+
+  <!-- 3 · PARTIAL FRAMES -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">03</div>
+      <div>
+        <h2>Hard part one — partial frames</h2>
+        <p class="kicker">correctness under fragmentation</p>
+      </div>
+    </div>
+    <p>The naive decoder assumes <em>one read equals one message</em>. It passes every test on localhost, where messages usually do arrive whole — then quietly corrupts data in production the first time the network splits a frame. The fix is a decoder that treats "not enough bytes yet" as a normal, expected state, not an error.</p>
+    <ul class="clean">
+      <li><span class="mk">1.</span><span><strong>Prefix not complete?</strong> If fewer than 4 bytes are buffered, you can't even know the frame size. Return <code>Ok(None)</code>, keep the bytes, reserve room for the rest of the prefix. (Try the <em>Drip 1 byte</em> button above — it stays <code>Ok(None)</code> for the first three bytes.)</span></li>
+      <li><span class="mk">2.</span><span><strong>Prefix complete, payload not?</strong> Now you know the length, but the body is still arriving. Return <code>Ok(None)</code> again and reserve exactly the number of missing bytes — so the next read can land in one allocation instead of growing the buffer repeatedly.</span></li>
+      <li><span class="mk">3.</span><span><strong>Whole frame present?</strong> Only now do you consume bytes and hand out a frame — then immediately loop and try to decode the <em>next</em> one, because a single read may hold several (the "two frames glued" scenario).</span></li>
+    </ul>
+    <p style="color:var(--muted);font-size:15px">The load-bearing detail is what <em>doesn't</em> happen: no partial data is ever dropped or misread. The buffer is the decoder's memory between calls.</p>
+  </section>
+
+  <!-- 4 · ZERO COPY -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">04</div>
+      <div>
+        <h2>Hard part two — zero-copy payloads</h2>
+        <p class="kicker">performance on the hot path</p>
+      </div>
+    </div>
+    <p>Once a whole frame is buffered, how do you hand it to the application? The obvious way allocates a fresh <code>Vec&lt;u8&gt;</code> and <strong>copies</strong> the payload into it. Fine once; at hundreds of thousands of messages per second it becomes allocator pressure and cache traffic — pure overhead on the busiest path in the program.</p>
+
+    <div class="zc-toggle" id="zc-toggle" role="group" aria-label="Handoff strategy">
+      <button data-mode="view" aria-pressed="true">split_to + freeze (this codec)</button>
+      <button data-mode="copy" aria-pressed="false">naive Vec copy</button>
+    </div>
+
+    <div class="panel" id="zc-panel">
+      <div class="alloc">
+        <div class="alloc-title"><span>Receive buffer — one allocation</span><span class="refbadge" id="zc-refA">refcount 1</span></div>
+        <div class="alloc-bar">
+          <div class="b"></div><div class="b"></div><div class="b"></div><div class="b"></div>
+          <div class="b pay"></div><div class="b pay"></div><div class="b pay"></div><div class="b pay"></div><div class="b pay"></div><div class="b pay"></div>
+        </div>
+        <div style="font-size:11px;color:var(--faint);margin-top:6px">bytes 0–3 = prefix · bytes 4–9 = payload</div>
+      </div>
+
+      <div id="zc-explain"></div>
+    </div>
+    <p style="margin-top:16px;color:var(--muted);font-size:15px" id="zc-caption"></p>
+  </section>
+
+  <!-- 5 · THE CODE -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">05</div>
+      <div>
+        <h2>The decode() function, annotated</h2>
+        <p class="kicker">every branch you just watched, in ~20 lines</p>
+      </div>
+    </div>
+    <p>Here is the real thing from <code>src/codec.rs</code>. The colored highlights map to the simulator: <span style="color:var(--cyan)">prefix checks</span>, <span style="color:var(--red)">the oversized guard</span>, <span style="color:var(--amber)">the payload check</span>, and <span style="color:var(--green)">the zero-copy handoff</span>.</p>
+<pre><span class="kw">fn</span> <span class="fn">decode</span>(&amp;<span class="kw">mut self</span>, src: &amp;<span class="kw">mut</span> <span class="ty">BytesMut</span>) -&gt; <span class="ty">Result</span>&lt;<span class="ty">Option</span>&lt;<span class="ty">Bytes</span>&gt;&gt; {
+    <span class="c">// (1) Not even the length prefix yet — wait for more.</span>
+<span class="hl-cyan">    <span class="kw">if</span> src.len() &lt; <span class="lit">4</span> {
+        src.reserve(<span class="lit">4</span> - src.len());   <span class="c">// hint: how much more we want</span>
+        <span class="kw">return</span> <span class="lit">Ok</span>(<span class="lit">None</span>);
+    }</span>
+
+    <span class="c">// Peek the length without consuming — a partial payload must</span>
+    <span class="c">// leave the buffer untouched for the next call.</span>
+    <span class="kw">let</span> payload_len = <span class="ty">u32</span>::from_be_bytes(src[..<span class="lit">4</span>].try_into()?) <span class="kw">as</span> <span class="ty">usize</span>;
+
+    <span class="c">// (2) Reject oversized frames BEFORE allocating anything.</span>
+<span class="hl-red">    <span class="kw">if</span> payload_len &gt; <span class="kw">self</span>.max_frame_len {
+        <span class="kw">return</span> <span class="lit">Err</span>(<span class="ty">FrameError</span>::FrameTooLarge { .. });
+    }</span>
+
+    <span class="c">// (3) Prefix is here, but the whole payload isn't yet.</span>
+<span class="hl-amber">    <span class="kw">if</span> src.len() &lt; <span class="lit">4</span> + payload_len {
+        src.reserve(<span class="lit">4</span> + payload_len - src.len());
+        <span class="kw">return</span> <span class="lit">Ok</span>(<span class="lit">None</span>);
+    }</span>
+
+    src.advance(<span class="lit">4</span>);  <span class="c">// drop the prefix; we don't need it anymore</span>
+
+    <span class="c">// (4) Zero-copy handoff: split_to detaches the payload into a</span>
+    <span class="c">// handle sharing the SAME allocation; freeze makes it immutable.</span>
+    <span class="c">// No per-frame Vec, no memcpy — just a refcount bump.</span>
+<span class="hl-green">    <span class="kw">let</span> payload = src.split_to(payload_len).freeze();</span>
+    <span class="lit">Ok</span>(<span class="lit">Some</span>(payload))
+}</pre>
+    <p style="color:var(--muted);font-size:15px">Four guards, in order: prefix → size limit → payload → emit. Each early return is either "wait for more" or "reject". Only the final two lines produce a frame, and they don't copy it.</p>
+  </section>
+
+  <!-- 6 · MENTAL MODEL -->
+  <section>
+    <div class="sec-head">
+      <div class="sec-num">06</div>
+      <div>
+        <h2>The model to keep</h2>
+        <p class="kicker">what to remember when the code is gone</p>
+      </div>
+    </div>
+    <div class="mental">
+      <div class="card">
+        <div class="q">Where does state live between reads?</div>
+        <div>In the <code>BytesMut</code> buffer itself. The decoder is a pure function of "bytes currently buffered". Incomplete data simply stays there until the rest arrives — the buffer <em>is</em> the memory.</div>
+      </div>
+      <div class="card">
+        <div class="q">What does Ok(None) actually mean?</div>
+        <div>Not an error — a normal "insufficient bytes, try again later". It's the single mechanism that makes the decoder immune to how the network chose to chunk the stream.</div>
+      </div>
+      <div class="card">
+        <div class="q">Why is the payload a Bytes, not a Vec?</div>
+        <div><code>Bytes</code> is a refcounted <em>view</em> into the buffer that already holds the data. Handing it out costs a refcount bump, not an allocation and a copy. The shared buffer frees itself when the last view drops.</div>
+      </div>
+      <div class="card">
+        <div class="q">Is this what real systems do?</div>
+        <div>Yes — Postgres, Redis, Kafka, gRPC and game/RTC servers all frame length-first over TCP. They add auth, versioning, multiplexing on top, but these two mechanics — framing under partial reads, zero-copy payloads — are the same spine.</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="hairline"></div>
+  <footer>
+    <p style="max-width:70ch">This walkthrough mirrors the codec in <code>framed-echo</code> — <code>src/codec.rs</code> for the decoder, the unit tests for the drip-fed partial-frame case, and <code>cargo bench</code> for the throughput numbers. The simulator runs the exact same four-guard logic you'd read there.</p>
+  </footer>
+
+</div>
+
+<script>
+(() => {
+  "use strict";
+  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const $ = (id) => document.getElementById(id);
+  const sleep = (ms) => new Promise((r) => setTimeout(r, reduce ? 0 : ms));
+
+  // ---- encode a frame: 4-byte BE length prefix + ascii payload ----
+  const enc = (str) => {
+    const body = Array.from(str, (c) => c.charCodeAt(0) & 0xff);
+    const n = body.length;
+    return [(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff, ...body];
+  };
+  const encRaw = (declaredLen, body) => {
+    const n = declaredLen;
+    return [(n >>> 24) & 0xff, (n >>> 16) & 0xff, (n >>> 8) & 0xff, n & 0xff, ...body];
+  };
+
+  // ---- scenarios ----
+  const MiB = "8 MiB";
+  const scenarios = {
+    split: {
+      label: "One frame, split across reads",
+      desc: "The 15-byte frame \"framed-echo\" is delivered in three reads: 3 bytes, then 4, then 8. Watch the prefix complete first, then the payload.",
+      max: MiB, maxBytes: 8 * 1024 * 1024,
+      stream: enc("framed-echo"),
+      chunks: [3, 4, 8],
+    },
+    glued: {
+      label: "Two frames glued in one read",
+      desc: "Two frames — \"hi\" and \"world\" — arrive in a single read(). One receive, and the decoder drains both in order before returning Ok(None).",
+      max: MiB, maxBytes: 8 * 1024 * 1024,
+      stream: [...enc("hi"), ...enc("world")],
+      chunks: [15],
+    },
+    drip: {
+      label: "Drip feed, one byte at a time",
+      desc: "The frame \"drip\" arrives one byte per read — the worst-case fragmentation. It stays Ok(None) until the very last byte completes the frame.",
+      max: MiB, maxBytes: 8 * 1024 * 1024,
+      stream: enc("drip"),
+      chunks: [1, 1, 1, 1, 1, 1, 1, 1],
+    },
+    over: {
+      label: "Oversized frame — rejected",
+      desc: "max_frame_len is lowered to 8 bytes for this demo. The prefix declares a 100-byte payload, so the decoder errors the instant it reads the length — before allocating a single payload byte.",
+      max: "8 B (lowered for demo)", maxBytes: 8,
+      stream: encRaw(100, Array.from("payload…", (c) => c.charCodeAt(0) & 0xff)),
+      chunks: [4, 8],
+    },
+  };
+
+  // ---- state ----
+  let key = "split";
+  let buffer = [];      // bytes received but not yet consumed (the BytesMut)
+  let recv = 0;         // index into stream: how many bytes have arrived
+  let chunkIdx = 0;     // next predefined read boundary
+  let framesOut = 0;
+  let traceN = 0;
+  let poisoned = false; // decoder hit a fatal error
+  let busy = false;
+  let reserveHint = null; // {n, kind:'prefix'|'payload'}
+
+  const S = () => scenarios[key];
+
+  const printable = (b) => (b >= 32 && b < 127) ? String.fromCharCode(b) : "·";
+  const hex = (b) => b.toString(16).padStart(2, "0").toUpperCase();
+
+  // ---- rendering ----
+  function readU32(a) { return a[0] * 16777216 + a[1] * 65536 + a[2] * 256 + a[3]; }
+
+  // Pure interpretation of current buffer -> how to color it
+  function view() {
+    const len = buffer.length;
+    if (len < 4) return { stage: "prefix", prefixEnd: len, payEnd: len, declared: null };
+    const declared = readU32(buffer);
+    const payEnd = Math.min(len, 4 + declared);
+    return { stage: "payload", prefixEnd: 4, payEnd, declared };
+  }
+
+  function renderStream() {
+    const el = $("stream");
+    el.innerHTML = "";
+    const s = S().stream;
+    if (recv >= s.length) {
+      el.innerHTML = '<span style="color:var(--faint);font-family:var(--mono);font-size:12px">— stream drained —</span>';
+      return;
+    }
+    s.forEach((b, i) => {
+      const d = document.createElement("div");
+      d.className = "sbyte" + (i < recv ? " gone" : "") + (i === recv ? " next" : "");
+      d.textContent = hex(b);
+      el.appendChild(d);
+    });
+  }
+
+  function renderBuffer(emitRange) {
+    const el = $("buffer");
+    el.innerHTML = "";
+    if (buffer.length === 0 && !reserveHint) {
+      el.innerHTML = '<div class="buffer-empty">— buffer empty —</div>';
+      return;
+    }
+    const v = view();
+    buffer.forEach((b, i) => {
+      const c = document.createElement("div");
+      let cls = "cell";
+      if (i < v.prefixEnd) cls += " prefix";
+      else if (i < v.payEnd) cls += " payload";
+      if (emitRange && i < emitRange) cls += " emit";
+      c.className = cls;
+      c.innerHTML = `<span class="idx">${i}</span><span class="hex">${hex(b)}</span><span class="asc">${printable(b)}</span>`;
+      el.appendChild(c);
+    });
+    // ghost reserve cells
+    if (reserveHint) {
+      for (let i = 0; i < Math.min(reserveHint.n, 12); i++) {
+        const g = document.createElement("div");
+        g.className = "cell ghost";
+        g.innerHTML = `<span class="hex">··</span><span class="asc">&nbsp;</span>`;
+        el.appendChild(g);
+      }
+    }
+    const rn = $("reserve");
+    if (reserveHint) {
+      rn.className = "reserve-note" + (reserveHint.kind === "payload" ? " pay" : "");
+      rn.textContent = reserveHint.kind === "prefix"
+        ? `reserve(${reserveHint.n}) — waiting on ${reserveHint.n} more prefix byte(s)`
+        : `reserve(${reserveHint.n}) — length known, waiting on ${reserveHint.n} more payload byte(s)`;
+    } else {
+      rn.textContent = "";
+    }
+  }
+
+  function renderReadout() {
+    $("ro-name").textContent = S().label;
+    $("ro-max").textContent = S().max;
+    $("ro-buf").textContent = buffer.length + " B";
+    $("ro-out").textContent = String(framesOut);
+  }
+
+  function setVerdict(kind, text) {
+    const tags = { none: "Ok(None)", some: "Ok(Some)", err: "Err", idle: "idle" };
+    $("verdict").innerHTML =
+      `<span class="tag ${kind}">${tags[kind]}</span><span class="vtext">${text}</span>`;
+  }
+
+  function trace(cls, msg) {
+    const t = $("trace");
+    if (traceN === 0) t.innerHTML = "";
+    traceN++;
+    const line = document.createElement("div");
+    line.className = "line " + cls;
+    line.innerHTML = `<span class="num">${traceN}</span><span class="msg">${msg}</span>`;
+    t.appendChild(line);
+    t.scrollTop = t.scrollHeight;
+  }
+
+  function addFrame(bytes) {
+    const em = $("emitted");
+    if (framesOut === 0) em.innerHTML = "";
+    framesOut++;
+    const txt = bytes.map(printable).join("");
+    const chip = document.createElement("div");
+    chip.className = "frame-chip";
+    chip.innerHTML = `<span class="fc-pay">"${txt || "∅"}"</span><span class="fc-meta">${bytes.length} B · Bytes view</span>`;
+    em.appendChild(chip);
+  }
+
+  // ---- the decode drain loop (mirrors codec.rs) ----
+  async function drain() {
+    while (true) {
+      reserveHint = null;
+
+      if (poisoned) return;
+
+      // guard 1: prefix
+      if (buffer.length < 4) {
+        reserveHint = { n: 4 - buffer.length, kind: "prefix" };
+        renderBuffer();
+        setVerdict("none", `Only ${buffer.length}/4 prefix bytes buffered — keeping them, asking for more.`);
+        trace("", `decode() → Ok(None) &nbsp;// prefix incomplete (${buffer.length}/4)`);
+        return;
+      }
+
+      const declared = readU32(buffer);
+
+      // guard 2: oversized
+      if (declared > S().maxBytes) {
+        poisoned = true;
+        renderBuffer();
+        setVerdict("err", `Prefix declares ${declared} bytes > max ${S().maxBytes}. Rejected before allocating the payload.`);
+        trace("err", `decode() → Err(FrameTooLarge { len: ${declared}, max: ${S().maxBytes} })`);
+        $("btn-read").disabled = true; $("btn-drip").disabled = true; $("btn-all").disabled = true;
+        return;
+      }
+
+      const frameLen = 4 + declared;
+
+      // guard 3: payload incomplete
+      if (buffer.length < frameLen) {
+        const need = frameLen - buffer.length;
+        reserveHint = { n: need, kind: "payload" };
+        renderBuffer();
+        setVerdict("none", `Length = ${declared} known, but only ${buffer.length - 4}/${declared} payload bytes here — waiting.`);
+        trace("", `decode() → Ok(None) &nbsp;// length=${declared}, payload ${buffer.length - 4}/${declared}`);
+        return;
+      }
+
+      // guard 4: whole frame present — emit (zero-copy)
+      const payload = buffer.slice(4, frameLen);
+      renderBuffer(frameLen);          // flash the emitted region
+      setVerdict("some", `Full frame (len ${declared}) buffered → split_to(${declared}).freeze() — no copy, just a view.`);
+      trace("some", `decode() → Ok(Some(${declared} B)) &nbsp;// split_to + freeze`);
+      await sleep(520);
+      buffer = buffer.slice(frameLen); // advance past the consumed frame
+      addFrame(payload);
+      renderReadout();
+      renderBuffer();
+      await sleep(320);
+      // loop: a single read may hold more than one frame
+    }
+  }
+
+  async function receive(count) {
+    if (busy || poisoned) return;
+    const s = S().stream;
+    if (recv >= s.length) return;
+    busy = true;
+    setButtons(true);
+
+    const take = Math.min(count, s.length - recv);
+    const incoming = s.slice(recv, recv + take);
+    buffer.push(...incoming);
+    recv += take;
+    trace("recv", `recv → ${take} byte(s) into buffer (buffer now ${buffer.length} B)`);
+    renderStream();
+    renderBuffer();
+    renderReadout();
+    await sleep(260);
+    await drain();
+
+    busy = false;
+    setButtons(false);
+  }
+
+  function setButtons(disabled) {
+    const done = recv >= S().stream.length;
+    $("btn-read").disabled = disabled || poisoned || done;
+    $("btn-drip").disabled = disabled || poisoned || done;
+    $("btn-all").disabled = disabled || poisoned || done;
+    $("btn-reset").disabled = disabled;
+  }
+
+  // ---- controls ----
+  function nextReadSize() {
+    const c = S().chunks;
+    if (chunkIdx < c.length) return c[chunkIdx++];
+    return S().stream.length - recv; // fallback: rest
+  }
+
+  $("btn-read").onclick = () => receive(nextReadSize());
+  $("btn-drip").onclick = () => { receive(1); };
+  $("btn-all").onclick = () => receive(S().stream.length - recv);
+  $("btn-reset").onclick = () => reset();
+
+  function reset() {
+    buffer = []; recv = 0; chunkIdx = 0; framesOut = 0; traceN = 0;
+    poisoned = false; busy = false; reserveHint = null;
+    $("trace").innerHTML = '<div class="trace-empty">No calls yet.</div>';
+    $("emitted").innerHTML = '<div class="emitted-empty">None yet.</div>';
+    setVerdict("idle", "Receive some bytes to call the decoder.");
+    renderStream(); renderBuffer(); renderReadout(); setButtons(false);
+  }
+
+  // ---- scenario tabs ----
+  function buildTabs() {
+    const box = $("tabs");
+    Object.entries(scenarios).forEach(([k, sc]) => {
+      const b = document.createElement("button");
+      b.className = "tab";
+      b.textContent = sc.label;
+      b.setAttribute("aria-pressed", k === key ? "true" : "false");
+      b.onclick = () => { if (busy) return; key = k; syncTabs(); $("scenario-desc").textContent = sc.desc; reset(); };
+      box.appendChild(b);
+    });
+  }
+  function syncTabs() {
+    [...$("tabs").children].forEach((b, i) => {
+      b.setAttribute("aria-pressed", Object.keys(scenarios)[i] === key ? "true" : "false");
+    });
+  }
+
+  buildTabs();
+  $("scenario-desc").textContent = S().desc;
+  reset();
+
+  // ---- zero-copy diagram ----
+  const zcView = `
+    <div class="view-bracket" style="display:flex;align-items:center;gap:10px;margin:14px 0 6px">
+      <span class="arrow-view">└─ Bytes (payload view) ─┘ &nbsp;&nbsp;same memory, no copy</span>
+    </div>
+    <div class="alloc" style="border-color:var(--green)">
+      <div class="alloc-title"><span style="color:var(--green)">payload : Bytes</span><span class="refbadge">shares the buffer above · refcount now 2</span></div>
+      <div class="alloc-bar">
+        <div class="b pay" style="border-color:var(--green);background:var(--green-soft)"></div>
+        <div class="b pay" style="border-color:var(--green);background:var(--green-soft)"></div>
+        <div class="b pay" style="border-color:var(--green);background:var(--green-soft)"></div>
+        <div class="b pay" style="border-color:var(--green);background:var(--green-soft)"></div>
+        <div class="b pay" style="border-color:var(--green);background:var(--green-soft)"></div>
+        <div class="b pay" style="border-color:var(--green);background:var(--green-soft)"></div>
+      </div>
+      <div style="font-size:12px;color:var(--muted);margin-top:8px">Cost of the handoff: one refcount increment. When this view drops, the count falls to 1; when the buffer drops too, the memory frees automatically.</div>
+    </div>`;
+  const zcCopy = `
+    <div class="view-bracket" style="display:flex;align-items:center;gap:10px;margin:14px 0 6px">
+      <span class="arrow-copy">▼ memcpy — every byte duplicated into fresh memory</span>
+    </div>
+    <div class="alloc" style="border-color:var(--red)">
+      <div class="alloc-title"><span style="color:var(--red)">payload : Vec&lt;u8&gt;</span><span style="color:var(--red)">brand-new allocation, per frame</span></div>
+      <div class="alloc-bar">
+        <div class="b" style="border-color:var(--red);background:var(--red-soft)"></div>
+        <div class="b" style="border-color:var(--red);background:var(--red-soft)"></div>
+        <div class="b" style="border-color:var(--red);background:var(--red-soft)"></div>
+        <div class="b" style="border-color:var(--red);background:var(--red-soft)"></div>
+        <div class="b" style="border-color:var(--red);background:var(--red-soft)"></div>
+        <div class="b" style="border-color:var(--red);background:var(--red-soft)"></div>
+      </div>
+      <div style="font-size:12px;color:var(--muted);margin-top:8px">Cost of the handoff: an allocation plus a byte-for-byte copy — repeated for every single message. At high message rates this is the bottleneck.</div>
+    </div>`;
+  const zcCaptions = {
+    view: "One buffer, two handles into it. The application gets its payload without the runtime touching the bytes a second time — the essence of zero-copy.",
+    copy: "Correct, and perfectly fine at low rates. But each message pays for an allocation and a full copy, which is exactly the overhead the Bytes approach removes.",
+  };
+  function setZC(mode) {
+    $("zc-explain").innerHTML = mode === "view" ? zcView : zcCopy;
+    $("zc-refA").textContent = mode === "view" ? "refcount 1 → 2" : "refcount 1 (untouched)";
+    $("zc-caption").textContent = zcCaptions[mode];
+    [...$("zc-toggle").children].forEach((b) => b.setAttribute("aria-pressed", b.dataset.mode === mode ? "true" : "false"));
+  }
+  [...$("zc-toggle").children].forEach((b) => { b.onclick = () => setZC(b.dataset.mode); });
+  setZC("view");
+})();
+</script>
+</body>
+</html>

@@ -14,6 +14,19 @@ It exists to show two mechanics clearly and correctly:
 Both are commented inline where they happen, in
 [`src/codec.rs`](src/codec.rs).
 
+### Interactive walkthrough
+
+An interactive, browser-based walkthrough lives in [`docs/`](docs/index.html):
+drive bytes into the receive buffer the way a real socket would, and watch each
+`decode()` call decide — partial prefix, partial payload, oversized rejection,
+and the zero-copy handoff — with a live trace. It runs the same four-guard logic
+as the codec.
+
+When this repo is pushed to GitHub with Pages enabled (**Settings → Pages →
+Source: "Deploy from a branch" → `main` / `docs`**), it is served at
+<https://1-bit-wonder.github.io/framed-echo/>. It is a single self-contained
+HTML file with no build step and no external assets.
+
 ---
 
 ## Plain-language explainer
