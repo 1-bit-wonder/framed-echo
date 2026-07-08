@@ -1,0 +1,30 @@
+[package]
+name = "framed-echo"
+version = "0.1.0"
+edition = "2021"
+description = "Zero-copy length-prefixed framing codec and async echo server over Tokio"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1"
+futures = "0.3"
+
+[dev-dependencies]
+# `test-util` is handy for deterministic async tests; criterion drives benches.
+tokio = { version = "1", features = ["full", "test-util"] }
+criterion = "0.5"
+
+[[bin]]
+name = "framed-echo-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "framed-echo-client"
+path = "src/bin/client.rs"
+
+[[bench]]
+name = "codec"
+harness = false
