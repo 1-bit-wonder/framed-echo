@@ -70,11 +70,13 @@ impl FrameCodec {
 
     /// A codec with an explicit maximum payload length.
     ///
-    /// The maximum is capped at `u32::MAX` because the wire prefix is a `u32`;
-    /// larger values would be unrepresentable on the wire.
+    /// The maximum is capped at `u32::MAX - LENGTH_PREFIX_LEN`: the wire prefix
+    /// is a `u32`, so larger payloads are unrepresentable, and reserving the
+    /// last four values guarantees `LENGTH_PREFIX_LEN + payload_len` can never
+    /// overflow `usize` (which it otherwise could on a 32-bit target).
     pub fn with_max_frame_len(max_frame_len: usize) -> Self {
         Self {
-            max_frame_len: max_frame_len.min(u32::MAX as usize),
+            max_frame_len: max_frame_len.min(u32::MAX as usize - LENGTH_PREFIX_LEN),
         }
     }
 
@@ -116,12 +118,20 @@ impl Decoder for FrameCodec {
         // Because we never `reserve` the payload until it passes this check, a
         // hostile or corrupt prefix cannot make us allocate gigabytes.
         if payload_len > self.max_frame_len {
+            // Consume the prefix before erroring so the buffer makes progress
+            // regardless of the driver. `Framed` fuses on a decode error, but a
+            // manual `loop { decode() }` would otherwise spin forever on the
+            // same oversized prefix.
+            src.advance(LENGTH_PREFIX_LEN);
             return Err(FrameError::FrameTooLarge {
                 len: payload_len,
                 max: self.max_frame_len,
             });
         }
 
+        // Cannot overflow: `payload_len <= max_frame_len <= u32::MAX -
+        // LENGTH_PREFIX_LEN` (enforced at construction), so the sum fits in
+        // `usize` on every target width.
         let frame_len = LENGTH_PREFIX_LEN + payload_len;
 
         // --- Partial-frame handling, part 2: the payload ---
@@ -262,6 +272,10 @@ mod tests {
             }
             other => panic!("expected FrameTooLarge, got {other:?}"),
         }
+        // The prefix is consumed on rejection so the buffer makes progress and a
+        // manual decode loop can't spin on the same oversized frame; only the
+        // 9 payload bytes remain.
+        assert_eq!(buf.len(), 9);
     }
 
     #[test]
